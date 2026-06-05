@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+.venv39/
+
+# Zonas generadas al correr el pipeline
+cloud_provider_challenge_dataset_v1/datalake/bronze/
+cloud_provider_challenge_dataset_v1/datalake/silver/
+cloud_provider_challenge_dataset_v1/datalake/gold/
+cloud_provider_challenge_dataset_v1/datalake/quarantine/
+cloud_provider_challenge_dataset_v1/checkpoints/
