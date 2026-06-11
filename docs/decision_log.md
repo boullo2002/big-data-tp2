@@ -28,7 +28,7 @@ Los costos negativos leves se toleran como ajustes o creditos operativos, pero s
 
 La tabla principal se modela query-first para responder consultas por organizacion y rango de fechas. La primary key `((org_id), usage_date, service)` permite leer una organizacion ordenada por fecha descendente y servicio.
 
-Para el Top-N de servicios por costo acumulado en los ultimos 14 dias se agrega `org_service_cost_last_14d`. Cassandra no es eficiente para agregaciones globales ad hoc, por lo que se preagrega desde Spark y se guarda una tabla orientada a esa consulta.
+Para mantener el MVP alineado con la consigna del segundo parcial, Serving expone una sola tabla Cassandra para el mart `org_daily_usage_by_service`. Las dos consultas de aceptacion se responden desde esa tabla: costo/uso por rango de fechas y detalle de servicios con `anomaly_event_count` para una fecha puntual.
 
 ## Idempotencia
 

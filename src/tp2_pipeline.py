@@ -438,11 +438,18 @@ def write_cassandra(
 ) -> None:
     from cassandra.auth import PlainTextAuthProvider
     from cassandra.cluster import Cluster
+    from cassandra.concurrent import execute_concurrent_with_args
 
     host_list = [host.strip() for host in hosts.split(",") if host.strip()]
     auth_provider = PlainTextAuthProvider(username, password) if username and password else None
-    cluster = Cluster(host_list, auth_provider=auth_provider)
+    cluster = Cluster(
+        host_list,
+        auth_provider=auth_provider,
+        connect_timeout=30,
+        control_connection_timeout=30,
+    )
     session = cluster.connect(keyspace)
+    session.default_timeout = 60
 
     insert_cql = f"""
         INSERT INTO {table} (
@@ -453,31 +460,74 @@ def write_cassandra(
     """
     prepared = session.prepare(insert_cql)
 
-    for row in mart.collect():
-        session.execute(
-            prepared,
-            (
-                row.org_id,
-                row.usage_date,
-                row.service,
-                row.org_name,
-                row.plan_tier,
-                row.hq_region,
-                row.event_count,
-                row.requests,
-                row.total_value,
-                row.cpu_hours,
-                row.storage_gb_hours,
-                row.genai_tokens,
-                row.carbon_kg,
-                row.daily_cost_usd,
-                row.anomaly_event_count,
-                row.updated_at,
-            ),
+    columns = [
+        "org_id",
+        "usage_date",
+        "service",
+        "org_name",
+        "plan_tier",
+        "hq_region",
+        "event_count",
+        "requests",
+        "total_value",
+        "cpu_hours",
+        "storage_gb_hours",
+        "genai_tokens",
+        "carbon_kg",
+        "daily_cost_usd",
+        "anomaly_event_count",
+        "updated_at",
+    ]
+
+    def row_args(row):
+        return (
+            row.org_id,
+            row.usage_date,
+            row.service,
+            row.org_name,
+            row.plan_tier,
+            row.hq_region,
+            row.event_count,
+            row.requests,
+            row.total_value,
+            row.cpu_hours,
+            row.storage_gb_hours,
+            row.genai_tokens,
+            row.carbon_kg,
+            row.daily_cost_usd,
+            row.anomaly_event_count,
+            row.updated_at,
         )
-    session.shutdown()
-    cluster.shutdown()
-    print(f"serving.cassandra: wrote {mart.count()} rows to {keyspace}.{table}")
+
+    def flush(batch):
+        if not batch:
+            return 0
+        results = execute_concurrent_with_args(
+            session,
+            prepared,
+            batch,
+            concurrency=8,
+            raise_on_first_error=False,
+        )
+        failures = [result for success, result in results if not success]
+        if failures:
+            sample = failures[0]
+            raise RuntimeError(f"Cassandra load failed for {len(failures)} rows. First error: {sample}")
+        return len(batch)
+
+    written = 0
+    batch = []
+    try:
+        for row in mart.select(*columns).toLocalIterator():
+            batch.append(row_args(row))
+            if len(batch) >= 500:
+                written += flush(batch)
+                batch = []
+        written += flush(batch)
+    finally:
+        session.shutdown()
+        cluster.shutdown()
+    print(f"serving.cassandra: wrote {written} rows to {keyspace}.{table}")
 
 
 def print_idempotence_evidence(spark: SparkSession, paths: Paths) -> None:

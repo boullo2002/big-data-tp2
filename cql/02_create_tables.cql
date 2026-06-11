@@ -19,15 +19,3 @@ CREATE TABLE IF NOT EXISTS org_daily_usage_by_service (
     updated_at timestamp,
     PRIMARY KEY ((org_id), usage_date, service)
 ) WITH CLUSTERING ORDER BY (usage_date DESC, service ASC);
-
-CREATE TABLE IF NOT EXISTS org_service_cost_last_14d (
-    org_id text,
-    window_end_date date,
-    total_cost_bucket int,
-    service text,
-    total_cost_usd double,
-    requests double,
-    event_count bigint,
-    updated_at timestamp,
-    PRIMARY KEY ((org_id, window_end_date), total_cost_bucket, service)
-) WITH CLUSTERING ORDER BY (total_cost_bucket DESC, service ASC);

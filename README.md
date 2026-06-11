@@ -1,6 +1,6 @@
 # Big Data TP2 - Cloud Provider Analytics
 
-Entrega del segundo parcial basada en el diseno del TP1. El objetivo es demostrar un MVP end-to-end:
+Entrega del segundo parcial basada en el diseno del TP1. El objetivo es demostrar un MVP tecnico end-to-end minimo:
 
 `Landing -> Bronze -> Silver -> Gold -> Serving Cassandra/AstraDB`
 
@@ -9,7 +9,7 @@ Entrega del segundo parcial basada en el diseno del TP1. El objetivo es demostra
 - `notebooks/segundo_parcial_big_data.ipynb`: notebook principal para Colab.
 - `src/tp2_pipeline.py`: modulo reutilizable con la logica PySpark.
 - `cql/01_create_keyspace.cql`: creacion de keyspace.
-- `cql/02_create_tables.cql`: tablas query-first.
+- `cql/02_create_tables.cql`: tabla query-first para el mart FinOps.
 - `cql/03_queries_demo.cql`: consultas de demo.
 - `docs/decision_log.md`: decisiones tecnicas.
 - `docs/evidencias.md`: checklist de evidencias.
@@ -97,10 +97,9 @@ cql/02_create_tables.cql
 cql/03_queries_demo.cql
 ```
 
-El notebook incluye funciones para cargar:
+El notebook incluye la carga del mart requerido:
 
 - `org_daily_usage_by_service`
-- `org_service_cost_last_14d`
 
 ## Como validar la entrega
 
@@ -113,7 +112,7 @@ El notebook debe imprimir:
 - mart Gold `org_daily_usage_by_service`;
 - conteos antes/despues de reprocesar Silver/Gold;
 - CQL ejecutado;
-- resultados de las dos consultas sobre AstraDB.
+- resultados de dos consultas sobre `org_daily_usage_by_service` en AstraDB.
 
 ## Decisiones principales
 

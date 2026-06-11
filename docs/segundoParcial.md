@@ -65,7 +65,7 @@ Gold materializa el mart FinOps `org_daily_usage_by_service`, con grano diario p
 
 ## **2.5 Serving**
 
-Serving se resuelve con Cassandra/AstraDB. La tabla se modela query-first con primary key `((org_id, usage_date), service)`, priorizando dashboards y consultas por organizacion y dia.
+Serving se resuelve con Cassandra/AstraDB. La tabla se modela query-first con primary key `((org_id), usage_date, service)`, priorizando dashboards y consultas por organizacion y rango de fechas.
 
 # **3. Requisitos de la Consigna**
 
@@ -94,10 +94,10 @@ El mart `org_daily_usage_by_service` agrupa por `org_id`, `usage_date` y `servic
 
 ## **3.5 Cassandra**
 
-Los scripts `cql/01_create_keyspace.cql`, `cql/02_create_tables.cql` y `cql/03_queries_demo.cql` crean el keyspace, las tablas y las consultas minimas:
+Los scripts `cql/01_create_keyspace.cql`, `cql/02_create_tables.cql` y `cql/03_queries_demo.cql` crean el keyspace, la tabla query-first del mart FinOps y las consultas minimas:
 
 - costo y uso diario por organizacion, fecha y servicio;
-- detalle de servicios y anomalias para una organizacion y fecha.
+- detalle de servicios y anomalias para una organizacion en una fecha.
 
 ## **3.6 Idempotencia**
 

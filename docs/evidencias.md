@@ -41,5 +41,5 @@ Idempotencia OK: True
 - Captura de ejecucion de `01_create_keyspace.cql`.
 - Captura de ejecucion de `02_create_tables.cql`.
 - Captura de tabla `org_daily_usage_by_service` poblada.
-- Resultado de consulta 1.
-- Resultado de consulta 2.
+- Resultado de consulta 1 sobre `org_daily_usage_by_service`.
+- Resultado de consulta 2 sobre `org_daily_usage_by_service`.
