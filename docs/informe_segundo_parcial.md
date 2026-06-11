@@ -143,11 +143,26 @@ Bronze batch, Silver y Gold escriben en modo `overwrite`. Streaming usa checkpoi
 - `notebooks/segundo_parcial_big_data.ipynb`: notebook reproducible para Colab.
 - `src/tp2_pipeline.py`: modulo PySpark reutilizable.
 - `cql/01_create_keyspace.cql`: creacion de keyspace.
-- `cql/02_create_tables.cql`: tabla query-first del mart FinOps.
+- `cql/02_create_tables.cql`: tablas query-first de los marts Gold.
 - `cql/03_queries_demo.cql`: consultas de aceptacion.
+- `dashboard/index.html`: visualizacion estatica de los marts Gold.
+- `dashboard/data/marts.json`: snapshot exportado desde Gold para visualizar FinOps, Billing, Soporte, Producto y Anomalias.
 - `docs/decision_log.md`: decisiones tecnicas resumidas.
 - `docs/evidencias.md`: checklist de evidencias a adjuntar.
 
-## 6. Conclusion
+## 6. Extensiones TP1
+
+Ademas del alcance minimo del segundo parcial, se materializan los marts adicionales propuestos en el primer parcial:
+
+- `revenue_by_org_month`: mart FinOps mensual por organizacion, con revenue bruto, creditos, impuestos y revenue neto en USD.
+- `cost_anomaly_mart`: mart FinOps de eventos anomalos de costo, con conteos de anomalias negativas y de alto costo.
+- `tickets_by_org_date`: mart de Soporte por organizacion, fecha, categoria y severidad, con SLA breach rate y CSAT promedio.
+- `genai_tokens_by_org_date`: mart de Producto por organizacion y fecha, con consumo de tokens GenAI, costo estimado y huella de carbono.
+
+Estos marts se escriben en Gold como Parquet y cuentan con tablas Cassandra query-first y consultas demo en `cql/02_create_tables.cql` y `cql/03_queries_demo.cql`.
+
+Como cierre de la capa de visualizacion planteada en el TP1, se agrega un dashboard estatico en `dashboard/index.html` alimentado por un snapshot JSON de los marts Gold.
+
+## 7. Conclusion
 
 La entrega implementa el end-to-end minimo pedido por la consigna: ingesta batch y streaming, capas Bronze/Silver/Gold en Parquet, reglas de calidad con Quarantine, mart FinOps y serving en Cassandra/AstraDB. El diseno conserva el criterio Lambda del TP1, pero acotado al MVP tecnico solicitado para el segundo parcial.

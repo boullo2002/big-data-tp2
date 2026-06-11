@@ -9,8 +9,10 @@ Entrega del segundo parcial basada en el diseno del TP1. El objetivo es demostra
 - `notebooks/segundo_parcial_big_data.ipynb`: notebook principal para Colab.
 - `src/tp2_pipeline.py`: modulo reutilizable con la logica PySpark.
 - `cql/01_create_keyspace.cql`: creacion de keyspace.
-- `cql/02_create_tables.cql`: tabla query-first para el mart FinOps.
+- `cql/02_create_tables.cql`: tablas query-first para los marts Gold.
 - `cql/03_queries_demo.cql`: consultas de demo.
+- `dashboard/index.html`: visualizacion estatica basada en los marts Gold.
+- `dashboard/data/marts.json`: snapshot liviano exportado desde Gold para el dashboard.
 - `docs/decision_log.md`: decisiones tecnicas.
 - `docs/evidencias.md`: checklist de evidencias.
 - `cloud_provider_challenge_dataset_v1/`: dataset provisto, si esta presente localmente.
@@ -101,6 +103,23 @@ El notebook incluye la carga del mart requerido:
 
 - `org_daily_usage_by_service`
 
+Ademas, el pipeline materializa los marts extra planteados en el TP1:
+
+- `revenue_by_org_month`
+- `cost_anomaly_mart`
+- `tickets_by_org_date`
+- `genai_tokens_by_org_date`
+
+## Dashboard de visualizacion
+
+La capa de visualizacion del TP1 queda materializada en `dashboard/index.html`, consumiendo `dashboard/data/marts.json`, que se exporta desde los marts Gold. Para verlo:
+
+```bash
+python3 -m http.server 8000 --directory dashboard
+```
+
+Luego abrir `http://localhost:8000`.
+
 ## Como validar la entrega
 
 El notebook debe imprimir:
@@ -110,6 +129,8 @@ El notebook debe imprimir:
 - schema de tablas importantes;
 - ejemplos quarantined con `dq_reason`;
 - mart Gold `org_daily_usage_by_service`;
+- marts extra TP1 en Gold (`revenue_by_org_month`, `cost_anomaly_mart`, `tickets_by_org_date`, `genai_tokens_by_org_date`);
+- dashboard estatico con KPIs y vistas FinOps, Billing, Soporte, Producto y Anomalias;
 - conteos antes/despues de reprocesar Silver/Gold;
 - CQL ejecutado;
 - resultados de dos consultas sobre `org_daily_usage_by_service` en AstraDB.

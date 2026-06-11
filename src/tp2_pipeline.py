@@ -428,6 +428,143 @@ def build_gold_finops(spark: SparkSession, paths: Paths) -> DataFrame:
     return mart
 
 
+def build_gold_revenue_by_org_month(spark: SparkSession, paths: Paths) -> DataFrame:
+    billing = spark.read.parquet(str(paths.bronze / "billing_monthly"))
+    orgs = spark.read.parquet(str(paths.bronze / "customers_orgs")).select(
+        "org_id", "org_name", "industry", "plan_tier", "hq_region", "lifecycle_stage"
+    )
+
+    mart = (
+        billing.join(orgs, "org_id", "left")
+        .withColumn("gross_revenue_usd", F.col("subtotal") * F.col("exchange_rate_to_usd"))
+        .withColumn("credits_usd", F.col("credits") * F.col("exchange_rate_to_usd"))
+        .withColumn("taxes_usd", F.col("taxes") * F.col("exchange_rate_to_usd"))
+        .withColumn(
+            "net_revenue_usd",
+            (F.col("subtotal") - F.col("credits") + F.col("taxes")) * F.col("exchange_rate_to_usd"),
+        )
+        .groupBy("org_id", "month", "org_name", "industry", "plan_tier", "hq_region", "lifecycle_stage")
+        .agg(
+            F.countDistinct("invoice_id").alias("invoice_count"),
+            F.round(F.sum("gross_revenue_usd"), 4).alias("gross_revenue_usd"),
+            F.round(F.sum("credits_usd"), 4).alias("credits_usd"),
+            F.round(F.sum("taxes_usd"), 4).alias("taxes_usd"),
+            F.round(F.sum("net_revenue_usd"), 4).alias("net_revenue_usd"),
+        )
+        .withColumn("updated_at", F.current_timestamp())
+    )
+    write_parquet(mart, paths.gold / "revenue_by_org_month", ["month"])
+    print(f"gold.revenue_by_org_month: {mart.count()} rows")
+    return mart
+
+
+def build_gold_cost_anomaly_mart(spark: SparkSession, paths: Paths) -> DataFrame:
+    events = spark.read.parquet(str(paths.silver / "usage_events"))
+    mart = (
+        events.filter(F.col("is_cost_anomaly"))
+        .groupBy("org_id", "usage_date", "service", "org_name", "plan_tier", "hq_region")
+        .agg(
+            F.count("*").alias("anomaly_event_count"),
+            F.sum(F.when(F.col("cost_usd_increment") < 0, 1).otherwise(0)).alias("negative_cost_event_count"),
+            F.sum(F.when(F.col("cost_usd_increment") > 50, 1).otherwise(0)).alias("high_cost_event_count"),
+            F.round(F.sum("daily_cost_usd"), 4).alias("anomaly_cost_usd"),
+            F.round(F.max("cost_usd_increment"), 4).alias("max_event_cost_usd"),
+            F.round(F.min("cost_usd_increment"), 4).alias("min_event_cost_usd"),
+        )
+        .withColumn("updated_at", F.current_timestamp())
+    )
+    write_parquet(mart, paths.gold / "cost_anomaly_mart", ["usage_date"])
+    print(f"gold.cost_anomaly_mart: {mart.count()} rows")
+    return mart
+
+
+def build_gold_tickets_by_org_date(spark: SparkSession, paths: Paths) -> DataFrame:
+    tickets = spark.read.parquet(str(paths.bronze / "support_tickets"))
+    orgs = spark.read.parquet(str(paths.bronze / "customers_orgs")).select(
+        "org_id", "org_name", "industry", "plan_tier", "hq_region"
+    )
+
+    mart = (
+        tickets.join(orgs, "org_id", "left")
+        .withColumn("ticket_date", F.to_date("created_at"))
+        .withColumn("is_resolved", F.col("resolved_at").isNotNull())
+        .groupBy("org_id", "ticket_date", "category", "severity", "org_name", "industry", "plan_tier", "hq_region")
+        .agg(
+            F.countDistinct("ticket_id").alias("ticket_count"),
+            F.sum(F.col("is_resolved").cast("long")).alias("resolved_ticket_count"),
+            F.sum((~F.col("is_resolved")).cast("long")).alias("open_ticket_count"),
+            F.sum(F.col("sla_breached").cast("long")).alias("sla_breach_count"),
+            F.round(F.avg(F.col("sla_breached").cast("double")), 4).alias("sla_breach_rate"),
+            F.round(F.avg("csat"), 4).alias("avg_csat"),
+        )
+        .withColumn("updated_at", F.current_timestamp())
+    )
+    write_parquet(mart, paths.gold / "tickets_by_org_date", ["ticket_date"])
+    print(f"gold.tickets_by_org_date: {mart.count()} rows")
+    return mart
+
+
+def build_gold_genai_tokens_by_org_date(spark: SparkSession, paths: Paths) -> DataFrame:
+    events = spark.read.parquet(str(paths.silver / "usage_events"))
+    mart = (
+        events.filter((F.col("service") == "genai") | (F.col("genai_tokens") > 0))
+        .groupBy("org_id", "usage_date", "org_name", "plan_tier", "hq_region")
+        .agg(
+            F.count("*").alias("event_count"),
+            F.sum("requests").alias("requests"),
+            F.sum("genai_tokens").alias("genai_tokens"),
+            F.round(F.sum("daily_cost_usd"), 4).alias("estimated_token_cost_usd"),
+            F.sum("carbon_kg").alias("carbon_kg"),
+        )
+        .withColumn("updated_at", F.current_timestamp())
+    )
+    write_parquet(mart, paths.gold / "genai_tokens_by_org_date", ["usage_date"])
+    print(f"gold.genai_tokens_by_org_date: {mart.count()} rows")
+    return mart
+
+
+def write_cassandra_table(
+    df: DataFrame,
+    session,
+    table: str,
+    columns: Iterable[str],
+    batch_size: int = 500,
+    concurrency: int = 8,
+) -> int:
+    from cassandra.concurrent import execute_concurrent_with_args
+
+    cols = list(columns)
+    placeholders = ", ".join(["?"] * len(cols))
+    column_list = ", ".join(cols)
+    prepared = session.prepare(f"INSERT INTO {table} ({column_list}) VALUES ({placeholders})")
+
+    def flush(batch):
+        if not batch:
+            return 0
+        results = execute_concurrent_with_args(
+            session,
+            prepared,
+            batch,
+            concurrency=concurrency,
+            raise_on_first_error=False,
+        )
+        failures = [result for success, result in results if not success]
+        if failures:
+            sample = failures[0]
+            raise RuntimeError(f"Cassandra load failed for {len(failures)} rows in {table}. First error: {sample}")
+        return len(batch)
+
+    written = 0
+    batch = []
+    for row in df.select(*cols).toLocalIterator():
+        batch.append(tuple(getattr(row, col) for col in cols))
+        if len(batch) >= batch_size:
+            written += flush(batch)
+            batch = []
+    written += flush(batch)
+    return written
+
+
 def write_cassandra(
     mart: DataFrame,
     hosts: str,
@@ -438,7 +575,6 @@ def write_cassandra(
 ) -> None:
     from cassandra.auth import PlainTextAuthProvider
     from cassandra.cluster import Cluster
-    from cassandra.concurrent import execute_concurrent_with_args
 
     host_list = [host.strip() for host in hosts.split(",") if host.strip()]
     auth_provider = PlainTextAuthProvider(username, password) if username and password else None
@@ -450,15 +586,6 @@ def write_cassandra(
     )
     session = cluster.connect(keyspace)
     session.default_timeout = 60
-
-    insert_cql = f"""
-        INSERT INTO {table} (
-            org_id, usage_date, service, org_name, plan_tier, hq_region,
-            event_count, requests, total_value, cpu_hours, storage_gb_hours,
-            genai_tokens, carbon_kg, daily_cost_usd, anomaly_event_count, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """
-    prepared = session.prepare(insert_cql)
 
     columns = [
         "org_id",
@@ -478,52 +605,8 @@ def write_cassandra(
         "anomaly_event_count",
         "updated_at",
     ]
-
-    def row_args(row):
-        return (
-            row.org_id,
-            row.usage_date,
-            row.service,
-            row.org_name,
-            row.plan_tier,
-            row.hq_region,
-            row.event_count,
-            row.requests,
-            row.total_value,
-            row.cpu_hours,
-            row.storage_gb_hours,
-            row.genai_tokens,
-            row.carbon_kg,
-            row.daily_cost_usd,
-            row.anomaly_event_count,
-            row.updated_at,
-        )
-
-    def flush(batch):
-        if not batch:
-            return 0
-        results = execute_concurrent_with_args(
-            session,
-            prepared,
-            batch,
-            concurrency=8,
-            raise_on_first_error=False,
-        )
-        failures = [result for success, result in results if not success]
-        if failures:
-            sample = failures[0]
-            raise RuntimeError(f"Cassandra load failed for {len(failures)} rows. First error: {sample}")
-        return len(batch)
-
-    written = 0
-    batch = []
     try:
-        for row in mart.select(*columns).toLocalIterator():
-            batch.append(row_args(row))
-            if len(batch) >= 500:
-                written += flush(batch)
-                batch = []
-        written += flush(batch)
+        written = write_cassandra_table(mart, session, table, columns)
     finally:
         session.shutdown()
         cluster.shutdown()
@@ -535,6 +618,10 @@ def print_idempotence_evidence(spark: SparkSession, paths: Paths) -> None:
         "bronze_usage_events_stream": paths.bronze / "usage_events_stream",
         "silver_usage_events": paths.silver / "usage_events",
         "gold_org_daily_usage_by_service": paths.gold / "org_daily_usage_by_service",
+        "gold_revenue_by_org_month": paths.gold / "revenue_by_org_month",
+        "gold_cost_anomaly_mart": paths.gold / "cost_anomaly_mart",
+        "gold_tickets_by_org_date": paths.gold / "tickets_by_org_date",
+        "gold_genai_tokens_by_org_date": paths.gold / "genai_tokens_by_org_date",
     }
     for name, path in targets.items():
         if path.exists():
@@ -565,6 +652,10 @@ def main() -> None:
     ingest_usage_stream_to_bronze(spark, paths)
     build_silver_events(spark, paths)
     mart = build_gold_finops(spark, paths)
+    build_gold_revenue_by_org_month(spark, paths)
+    build_gold_cost_anomaly_mart(spark, paths)
+    build_gold_tickets_by_org_date(spark, paths)
+    build_gold_genai_tokens_by_org_date(spark, paths)
     print_idempotence_evidence(spark, paths)
 
     if args.write_cassandra:

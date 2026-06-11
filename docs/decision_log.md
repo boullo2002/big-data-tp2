@@ -10,6 +10,9 @@ Se mantiene la arquitectura Lambda definida en el TP1 porque la consigna requier
 - Bronze streaming: particion por `usage_date`.
 - Silver events: particion por `usage_date`.
 - Gold FinOps: particion por `usage_date`.
+- Gold revenue mensual: particion por `month`.
+- Gold tickets: particion por `ticket_date`.
+- Gold anomalias y GenAI: particion por `usage_date`.
 
 Estas particiones permiten reprocesar periodos puntuales y habilitan partition pruning en Spark.
 
@@ -26,9 +29,14 @@ Los costos negativos leves se toleran como ajustes o creditos operativos, pero s
 
 ## Cassandra
 
-La tabla principal se modela query-first para responder consultas por organizacion y rango de fechas. La primary key `((org_id), usage_date, service)` permite leer una organizacion ordenada por fecha descendente y servicio.
+La tabla principal del MVP se modela query-first para responder consultas por organizacion y rango de fechas. La primary key `((org_id), usage_date, service)` permite leer una organizacion ordenada por fecha descendente y servicio. Las dos consultas de aceptacion del segundo parcial se responden desde `org_daily_usage_by_service`: costo/uso por rango de fechas y detalle de servicios con `anomaly_event_count` para una fecha puntual.
 
-Para mantener el MVP alineado con la consigna del segundo parcial, Serving expone una sola tabla Cassandra para el mart `org_daily_usage_by_service`. Las dos consultas de aceptacion se responden desde esa tabla: costo/uso por rango de fechas y detalle de servicios con `anomaly_event_count` para una fecha puntual.
+Para cubrir los marts definidos en el TP1, Serving tambien expone tablas query-first adicionales:
+
+- `revenue_by_org_month`: `PRIMARY KEY ((org_id), month)`.
+- `cost_anomaly_mart`: `PRIMARY KEY ((org_id), usage_date, service)`.
+- `tickets_by_org_date`: `PRIMARY KEY ((org_id), ticket_date, category, severity)`.
+- `genai_tokens_by_org_date`: `PRIMARY KEY ((org_id), usage_date)`.
 
 ## Idempotencia
 
