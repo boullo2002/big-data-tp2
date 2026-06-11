@@ -4,6 +4,11 @@ __pycache__/
 .venv/
 .venv39/
 
+# Secretos de Astra (no subir a git)
+.env
+secure-connect-*.zip
+secrets/
+
 # Zonas generadas al correr el pipeline
 cloud_provider_challenge_dataset_v1/datalake/bronze/
 cloud_provider_challenge_dataset_v1/datalake/silver/

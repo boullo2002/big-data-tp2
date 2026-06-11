@@ -71,6 +71,14 @@ find cloud_provider_challenge_dataset_v1/datalake/quarantine -maxdepth 3 -type f
 
 ## AstraDB / Cassandra
 
+### Local (repo)
+
+1. Dejar el bundle en la raiz del repo, por ejemplo `secure-connect-tp2-bigdata.zip` (esta en `.gitignore`).
+2. Copiar `.env.example` a `.env` y completar `ASTRA_CLIENT_ID` y `ASTRA_CLIENT_SECRET`.
+3. El notebook detecta el zip automaticamente al correr la seccion 9.
+
+### Colab
+
 Configurar variables de entorno en Colab:
 
 ```python
