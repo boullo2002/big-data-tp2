@@ -1,7 +1,7 @@
 [project]
 name = "big-data-tp2"
 version = "0.1.0"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 dependencies = [
     "pyspark==3.5.1",
     "cassandra-driver==3.29.2",

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -356,6 +357,17 @@ def write_parquet(df: DataFrame, path: Path, partition_cols: Iterable[str]) -> N
     writer.parquet(str(path))
 
 
+def read_parquet_dir(spark: SparkSession, path: Path) -> DataFrame:
+    """Lee Parquet desde un directorio, tolerando metadatos de streaming sink."""
+    resolved = path.resolve()
+    if not any(resolved.rglob("*.parquet")):
+        raise FileNotFoundError(f"Sin archivos Parquet en {resolved}")
+    if (resolved / "_spark_metadata").exists():
+        parquet_glob = str(resolved / "*" / "*.parquet")
+        return spark.read.option("basePath", str(resolved)).parquet(parquet_glob)
+    return spark.read.parquet(str(resolved))
+
+
 def ingest_batch_to_bronze(spark: SparkSession, paths: Paths) -> None:
     for name, (schema, dedupe_keys) in CSV_SPECS.items():
         input_path = paths.landing / f"{name}.csv"
@@ -401,18 +413,31 @@ def ingest_usage_stream_to_bronze(spark: SparkSession, paths: Paths) -> None:
 
     # Reparquet: el stream genera muchos archivos chicos (1 por micro-batch por fecha).
     # Compactamos a 1 archivo por partición de fecha antes de que Silver lo lea.
+    # Escribimos en un path temporal: overwrite sobre el mismo directorio borra la
+    # fuente antes de que Spark termine de leerla.
     _info("compactando bronze stream (reparquet) ...")
-    spark.read.parquet(str(output_path)) \
+    if not any(output_path.rglob("*.parquet")):
+        _info("[SKIP] usage_events_stream vacío, sin reparquet")
+        return
+
+    compact_path = output_path.parent / f"{output_path.name}__compact"
+    if compact_path.exists():
+        shutil.rmtree(compact_path)
+
+    read_parquet_dir(spark, output_path) \
         .repartition(F.col("usage_date")) \
         .coalesce(1) \
         .write.mode("overwrite") \
         .partitionBy("usage_date") \
-        .parquet(str(output_path))
+        .parquet(str(compact_path))
+
+    shutil.rmtree(output_path)
+    compact_path.rename(output_path)
     _info(f"usage_events_stream  →  {output_path}")
 
 
 def build_silver_events(spark: SparkSession, paths: Paths) -> None:
-    events = spark.read.parquet(str(paths.bronze / "usage_events_stream"))
+    events = read_parquet_dir(spark, paths.bronze / "usage_events_stream")
     orgs = spark.read.parquet(str(paths.bronze / "customers_orgs")).select(
         "org_id", "org_name", "industry", "hq_region", "plan_tier", "lifecycle_stage"
     )
@@ -722,7 +747,10 @@ def print_idempotence_evidence(spark: SparkSession, paths: Paths) -> None:
     }
     for name, path in targets.items():
         if path.exists():
-            count = spark.read.parquet(str(path)).count()
+            if name == "bronze / usage_events_stream":
+                count = read_parquet_dir(spark, path).count()
+            else:
+                count = spark.read.parquet(str(path)).count()
             _ok(name, count, 0)
 
 
