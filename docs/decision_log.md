@@ -16,6 +16,8 @@ Se mantiene la arquitectura Lambda definida en el TP1 porque la consigna requier
 
 Estas particiones permiten reprocesar periodos puntuales y habilitan partition pruning en Spark.
 
+Para evitar el problema de small files, todos los writes batch usan `repartition(partition_col).coalesce(1)` antes de escribir, resultando en 1 archivo por partición. El streaming Bronze genera muchos archivos chicos (1 por micro-batch por fecha) por lo que se aplica un paso de reparquet inmediatamente después de que el stream termina, consolidando también a 1 archivo por fecha. Para datasets más grandes el target sería `ceil(size / 128 MB)` archivos por partición.
+
 ## Calidad de datos
 
 Reglas activas:
@@ -42,9 +44,9 @@ Para cubrir los marts definidos en el TP1, Serving tambien expone tablas query-f
 
 Bronze batch, Silver y Gold se escriben en modo `overwrite`. Streaming usa checkpointing y dedupe por `event_id`. En Cassandra, las primary keys permiten upsert natural. La re-ejecucion del pipeline no duplica registros porque cada capa reemplaza su salida o escribe sobre claves deterministicas.
 
-## Trade-offs de Colab
+## Entorno de ejecución
 
-Colab no es un ambiente productivo: las sesiones expiran, los recursos son variables y no hay cluster Spark real. Para el parcial es adecuado porque permite demostrar el recorrido tecnico completo con el dataset sintetico.
+El pipeline corre localmente con `uv` como gestor de dependencias y entorno virtual. Se eligió `uv` sobre `pip`/`venv` por su resolución determinista de dependencias (lockfile) y velocidad de instalación. El código es reproducible en cualquier máquina con Python 3.10+ y Java 11-21 sin configuración adicional.
 
 ## JSONL como stream simulado
 
