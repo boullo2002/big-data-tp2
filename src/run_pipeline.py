@@ -9,10 +9,63 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
+import sys
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Callable, Dict, Iterable, Iterator, Optional
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+_USE_COLOR = sys.stdout.isatty()
+_W = 68
+
+
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _USE_COLOR else text
+
+
+def _banner() -> None:
+    print(_c("1;36", "=" * _W))
+    print(_c("1;36", "  Pipeline  (Landing → Bronze → Silver → Gold)"))
+    print(_c("1;36", "=" * _W))
+    print()
+
+
+def _header(step: int, total: int, label: str) -> None:
+    tag = _c("1;33", f"[{step}/{total}]")
+    print(f"\n{tag} {_c('1', label)}")
+    print(_c("90", "─" * _W))
+
+
+def _ok(label: str, rows: int, elapsed: float) -> None:
+    rows_str = _c("32", f"{rows:>8,} filas")
+    time_str = _c("90", f"({elapsed:.1f}s)")
+    print(f"  {_c('32', '✓')}  {label:<38} {rows_str}  {time_str}")
+
+
+def _info(msg: str) -> None:
+    print(f"  {_c('36', '→')}  {msg}")
+
+
+def _done(label: str, elapsed: float) -> None:
+    print(_c("90", f"  └─ {label} completado en {elapsed:.1f}s"))
+
+
+@contextmanager
+def _step(step: int, total: int, label: str) -> Iterator[None]:
+    _header(step, total, label)
+    t0 = time.perf_counter()
+    yield
+    _done(label, time.perf_counter() - t0)
+
+
+_TOTAL_STEPS = 6
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -193,10 +246,7 @@ def configure_java_for_spark() -> None:
             return int(version.split(".")[1])
         return int(version.split(".")[0])
 
-    candidates = [
-        "/Users/juan/Library/Java/JavaVirtualMachines/corretto-21.0.2/Contents/Home",
-        "/Users/juan/Library/Java/JavaVirtualMachines/corretto-1.8.0_352/Contents/Home",
-    ]
+    candidates = []
 
     if Path("/usr/libexec/java_home").exists():
         for version in ("17", "21", "11", "1.8", "8"):
@@ -221,16 +271,27 @@ def configure_java_for_spark() -> None:
 
 def build_spark(app_name: str) -> SparkSession:
     configure_java_for_spark()
-    spark = (
-        SparkSession.builder.appName(app_name)
-        .master("local[*]")
-        .config("spark.sql.session.timeZone", "UTC")
-        .config("spark.sql.shuffle.partitions", "8")
-        .getOrCreate()
-    )
-    spark.sparkContext.setLogLevel("WARN")
+    # Los mensajes de startup del JVM (hostname, NativeCodeLoader, etc.) van directo
+    # al fd 2 antes de que setLogLevel pueda actuar. Redirigimos a /dev/null durante
+    # getOrCreate() y restauramos inmediatamente después.
+    stderr_fd = sys.stderr.fileno()
+    saved_fd = os.dup(stderr_fd)
+    with open(os.devnull, "w") as devnull:
+        os.dup2(devnull.fileno(), stderr_fd)
+        try:
+            spark = (
+                SparkSession.builder.appName(app_name)
+                .master("local[*]")
+                .config("spark.sql.session.timeZone", "UTC")
+                .config("spark.sql.shuffle.partitions", "8")
+                .getOrCreate()
+            )
+        finally:
+            os.dup2(saved_fd, stderr_fd)
+            os.close(saved_fd)
+    spark.sparkContext.setLogLevel("ERROR")
     java_version = spark.sparkContext._jvm.java.lang.System.getProperty("java.version")
-    print(f"Spark {spark.version} inicializado con Java {java_version}")
+    _info(f"Spark {spark.version}  |  Java {java_version}  |  local[*]")
     return spark
 
 
@@ -291,23 +352,41 @@ def normalize_batch_df(name: str, df: DataFrame) -> DataFrame:
 
 
 def write_parquet(df: DataFrame, path: Path, partition_cols: Iterable[str]) -> None:
-    writer = df.write.mode("overwrite")
     cols = list(partition_cols)
+    # Repartition by partition key garantiza que todos los registros de la misma
+    # partición queden en el mismo task; coalesce(1) los consolida en 1 archivo.
+    # Para este dataset (< 500 MB) es óptimo. En producción: ceil(size / 128 MB).
+    out = df.repartition(*[F.col(c) for c in cols]) if cols else df
+    out = out.coalesce(1)
+    writer = out.write.mode("overwrite")
     if cols:
         writer = writer.partitionBy(*cols)
     writer.parquet(str(path))
+
+
+def read_parquet_dir(spark: SparkSession, path: Path) -> DataFrame:
+    """Lee Parquet desde un directorio, tolerando metadatos de streaming sink."""
+    resolved = path.resolve()
+    if not any(resolved.rglob("*.parquet")):
+        raise FileNotFoundError(f"Sin archivos Parquet en {resolved}")
+    if (resolved / "_spark_metadata").exists():
+        parquet_glob = str(resolved / "*" / "*.parquet")
+        return spark.read.option("basePath", str(resolved)).parquet(parquet_glob)
+    return spark.read.parquet(str(resolved))
 
 
 def ingest_batch_to_bronze(spark: SparkSession, paths: Paths) -> None:
     for name, (schema, dedupe_keys) in CSV_SPECS.items():
         input_path = paths.landing / f"{name}.csv"
         if not input_path.exists():
+            _info(f"[SKIP] {name}.csv no encontrado")
             continue
+        t0 = time.perf_counter()
         df = read_csv(spark, input_path, schema)
         df = normalize_batch_df(name, add_technical_columns(df)).dropDuplicates(list(dedupe_keys))
         output_path = paths.bronze / name
         write_parquet(df, output_path, ["ingest_date"])
-        print(f"bronze_batch.{name}: {df.count()} rows -> {output_path}")
+        _ok(name, df.count(), time.perf_counter() - t0)
 
 
 def ingest_usage_stream_to_bronze(spark: SparkSession, paths: Paths) -> None:
@@ -331,17 +410,41 @@ def ingest_usage_stream_to_bronze(spark: SparkSession, paths: Paths) -> None:
         stream_df.writeStream.format("parquet")
         .option("path", str(output_path))
         .option("checkpointLocation", str(checkpoint_path))
+        .option("maxRecordsPerFile", 100_000)
         .partitionBy("usage_date")
         .outputMode("append")
         .trigger(availableNow=True)
         .start()
     )
     query.awaitTermination()
-    print(f"bronze_stream.usage_events -> {output_path}")
+
+    # Reparquet: el stream genera muchos archivos chicos (1 por micro-batch por fecha).
+    # Compactamos a 1 archivo por partición de fecha antes de que Silver lo lea.
+    # Escribimos en un path temporal: overwrite sobre el mismo directorio borra la
+    # fuente antes de que Spark termine de leerla.
+    _info("compactando bronze stream (reparquet) ...")
+    if not any(output_path.rglob("*.parquet")):
+        _info("[SKIP] usage_events_stream vacío, sin reparquet")
+        return
+
+    compact_path = output_path.parent / f"{output_path.name}__compact"
+    if compact_path.exists():
+        shutil.rmtree(compact_path)
+
+    read_parquet_dir(spark, output_path) \
+        .repartition(F.col("usage_date")) \
+        .coalesce(1) \
+        .write.mode("overwrite") \
+        .partitionBy("usage_date") \
+        .parquet(str(compact_path))
+
+    shutil.rmtree(output_path)
+    compact_path.rename(output_path)
+    _info(f"usage_events_stream  →  {output_path}")
 
 
 def build_silver_events(spark: SparkSession, paths: Paths) -> None:
-    events = spark.read.parquet(str(paths.bronze / "usage_events_stream"))
+    events = read_parquet_dir(spark, paths.bronze / "usage_events_stream")
     orgs = spark.read.parquet(str(paths.bronze / "customers_orgs")).select(
         "org_id", "org_name", "industry", "hq_region", "plan_tier", "lifecycle_stage"
     )
@@ -386,8 +489,15 @@ def build_silver_events(spark: SparkSession, paths: Paths) -> None:
         ),
     )
 
+    valid_base = conformed.filter(~invalid_condition)
+
+    p99_thresholds = (
+        valid_base.groupBy("service")
+        .agg(F.approx_percentile("cost_usd_increment", 0.90).alias("p90_cost"))
+    )
+
     valid = (
-        conformed.filter(~invalid_condition)
+        valid_base
         .withColumn("requests", F.when(F.col("metric") == "requests", F.col("value_num")).otherwise(F.lit(0.0)))
         .withColumn("cpu_hours", F.when(F.col("metric") == "cpu_hours", F.col("value_num")).otherwise(F.lit(0.0)))
         .withColumn(
@@ -396,14 +506,19 @@ def build_silver_events(spark: SparkSession, paths: Paths) -> None:
         )
         .withColumn("daily_cost_usd", F.col("cost_usd_increment"))
         .withColumn("total_value", F.coalesce(F.col("value_num"), F.lit(0.0)))
-        .withColumn("is_cost_anomaly", (F.col("cost_usd_increment") < 0) | (F.col("cost_usd_increment") > 50))
-        .drop("resource_id_dim", "resource_org_id", "resource_service", "resource_region")
+        .join(p99_thresholds, "service", "left")
+        .withColumn("is_cost_anomaly",
+            (F.col("cost_usd_increment") < 0) | (F.col("cost_usd_increment") > F.col("p90_cost"))
+        )
+        .drop("p90_cost", "resource_id_dim", "resource_org_id", "resource_service", "resource_region")
     )
 
     write_parquet(valid, paths.silver / "usage_events", ["usage_date"])
     write_parquet(quarantine, paths.quarantine / "usage_events", ["usage_date"])
-    print(f"silver.usage_events: {valid.count()} rows")
-    print(f"quarantine.usage_events: {quarantine.count()} rows")
+    valid_count = valid.count()
+    quar_count = quarantine.count()
+    _ok("usage_events  (válidos)", valid_count, 0)
+    _ok("usage_events  (quarantine)", quar_count, 0)
 
 
 def build_gold_finops(spark: SparkSession, paths: Paths) -> DataFrame:
@@ -424,80 +539,121 @@ def build_gold_finops(spark: SparkSession, paths: Paths) -> DataFrame:
         .withColumn("updated_at", F.current_timestamp())
     )
     write_parquet(mart, paths.gold / "org_daily_usage_by_service", ["usage_date"])
-    print(f"gold.org_daily_usage_by_service: {mart.count()} rows")
+    _ok("org_daily_usage_by_service", mart.count(), 0)
     return mart
 
 
-def write_cassandra(
-    mart: DataFrame,
-    hosts: str,
-    username: Optional[str],
-    password: Optional[str],
-    keyspace: str,
+def build_gold_revenue_by_org_month(spark: SparkSession, paths: Paths) -> DataFrame:
+    billing = spark.read.parquet(str(paths.bronze / "billing_monthly"))
+    orgs = spark.read.parquet(str(paths.bronze / "customers_orgs")).select(
+        "org_id", "org_name", "industry", "plan_tier", "hq_region", "lifecycle_stage"
+    )
+
+    mart = (
+        billing.join(orgs, "org_id", "left")
+        .withColumn("gross_revenue_usd", F.col("subtotal") * F.col("exchange_rate_to_usd"))
+        .withColumn("credits_usd", F.col("credits") * F.col("exchange_rate_to_usd"))
+        .withColumn("taxes_usd", F.col("taxes") * F.col("exchange_rate_to_usd"))
+        .withColumn(
+            "net_revenue_usd",
+            (F.col("subtotal") - F.col("credits") - F.col("taxes")) * F.col("exchange_rate_to_usd"),
+        )
+        .groupBy("org_id", "month", "org_name", "industry", "plan_tier", "hq_region", "lifecycle_stage")
+        .agg(
+            F.countDistinct("invoice_id").alias("invoice_count"),
+            F.round(F.sum("gross_revenue_usd"), 4).alias("gross_revenue_usd"),
+            F.round(F.sum("credits_usd"), 4).alias("credits_usd"),
+            F.round(F.sum("taxes_usd"), 4).alias("taxes_usd"),
+            F.round(F.sum("net_revenue_usd"), 4).alias("net_revenue_usd"),
+        )
+        .withColumn("updated_at", F.current_timestamp())
+    )
+    write_parquet(mart, paths.gold / "revenue_by_org_month", ["month"])
+    _ok("revenue_by_org_month", mart.count(), 0)
+    return mart
+
+
+def build_gold_cost_anomaly_mart(spark: SparkSession, paths: Paths) -> DataFrame:
+    events = spark.read.parquet(str(paths.silver / "usage_events"))
+    mart = (
+        events.filter(F.col("is_cost_anomaly"))
+        .groupBy("org_id", "usage_date", "service", "org_name", "plan_tier", "hq_region")
+        .agg(
+            F.count("*").alias("anomaly_event_count"),
+            F.sum(F.when(F.col("cost_usd_increment") < 0, 1).otherwise(0)).alias("negative_cost_event_count"),
+            F.sum(F.when(F.col("cost_usd_increment") >= 0, 1).otherwise(0)).alias("high_cost_event_count"),
+            F.round(F.sum("daily_cost_usd"), 4).alias("anomaly_cost_usd"),
+            F.round(F.max("cost_usd_increment"), 4).alias("max_event_cost_usd"),
+            F.round(F.min("cost_usd_increment"), 4).alias("min_event_cost_usd"),
+        )
+        .withColumn("updated_at", F.current_timestamp())
+    )
+    write_parquet(mart, paths.gold / "cost_anomaly_mart", ["usage_date"])
+    _ok("cost_anomaly_mart", mart.count(), 0)
+    return mart
+
+
+def build_gold_tickets_by_org_date(spark: SparkSession, paths: Paths) -> DataFrame:
+    tickets = spark.read.parquet(str(paths.bronze / "support_tickets"))
+    orgs = spark.read.parquet(str(paths.bronze / "customers_orgs")).select(
+        "org_id", "org_name", "industry", "plan_tier", "hq_region"
+    )
+
+    mart = (
+        tickets.join(orgs, "org_id", "left")
+        .withColumn("ticket_date", F.to_date("created_at"))
+        .withColumn("is_resolved", F.col("resolved_at").isNotNull())
+        .groupBy("org_id", "ticket_date", "category", "severity", "org_name", "industry", "plan_tier", "hq_region")
+        .agg(
+            F.countDistinct("ticket_id").alias("ticket_count"),
+            F.sum(F.col("is_resolved").cast("long")).alias("resolved_ticket_count"),
+            F.sum((~F.col("is_resolved")).cast("long")).alias("open_ticket_count"),
+            F.sum(F.col("sla_breached").cast("long")).alias("sla_breach_count"),
+            F.round(F.avg(F.col("sla_breached").cast("double")), 4).alias("sla_breach_rate"),
+            F.round(F.avg("csat"), 4).alias("avg_csat"),
+        )
+        .withColumn("updated_at", F.current_timestamp())
+    )
+    write_parquet(mart, paths.gold / "tickets_by_org_date", ["ticket_date"])
+    _ok("tickets_by_org_date", mart.count(), 0)
+    return mart
+
+
+
+def build_gold_genai_tokens_by_org_date(spark: SparkSession, paths: Paths) -> DataFrame:
+    events = spark.read.parquet(str(paths.silver / "usage_events"))
+    mart = (
+        events.filter((F.col("service") == "genai") | (F.col("genai_tokens") > 0))
+        .groupBy("org_id", "usage_date", "org_name", "plan_tier", "hq_region")
+        .agg(
+            F.count("*").alias("event_count"),
+            F.sum("requests").alias("requests"),
+            F.sum("genai_tokens").alias("genai_tokens"),
+            F.round(F.sum("daily_cost_usd"), 4).alias("estimated_token_cost_usd"),
+            F.sum("carbon_kg").alias("carbon_kg"),
+        )
+        .withColumn("updated_at", F.current_timestamp())
+    )
+    write_parquet(mart, paths.gold / "genai_tokens_by_org_date", ["usage_date"])
+    _ok("genai_tokens_by_org_date", mart.count(), 0)
+    return mart
+
+
+def write_cassandra_table(
+    df: DataFrame,
+    session,
     table: str,
-) -> None:
-    from cassandra.auth import PlainTextAuthProvider
-    from cassandra.cluster import Cluster
+    columns: Iterable[str],
+    batch_size: int = 500,
+    concurrency: int = 8,
+    on_progress: Optional[Callable[[int], None]] = None,
+) -> int:
     from cassandra.concurrent import execute_concurrent_with_args
 
-    host_list = [host.strip() for host in hosts.split(",") if host.strip()]
-    auth_provider = PlainTextAuthProvider(username, password) if username and password else None
-    cluster = Cluster(
-        host_list,
-        auth_provider=auth_provider,
-        connect_timeout=30,
-        control_connection_timeout=30,
-    )
-    session = cluster.connect(keyspace)
-    session.default_timeout = 60
-
-    insert_cql = f"""
-        INSERT INTO {table} (
-            org_id, usage_date, service, org_name, plan_tier, hq_region,
-            event_count, requests, total_value, cpu_hours, storage_gb_hours,
-            genai_tokens, carbon_kg, daily_cost_usd, anomaly_event_count, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """
-    prepared = session.prepare(insert_cql)
-
-    columns = [
-        "org_id",
-        "usage_date",
-        "service",
-        "org_name",
-        "plan_tier",
-        "hq_region",
-        "event_count",
-        "requests",
-        "total_value",
-        "cpu_hours",
-        "storage_gb_hours",
-        "genai_tokens",
-        "carbon_kg",
-        "daily_cost_usd",
-        "anomaly_event_count",
-        "updated_at",
-    ]
-
-    def row_args(row):
-        return (
-            row.org_id,
-            row.usage_date,
-            row.service,
-            row.org_name,
-            row.plan_tier,
-            row.hq_region,
-            row.event_count,
-            row.requests,
-            row.total_value,
-            row.cpu_hours,
-            row.storage_gb_hours,
-            row.genai_tokens,
-            row.carbon_kg,
-            row.daily_cost_usd,
-            row.anomaly_event_count,
-            row.updated_at,
-        )
+    cols = list(columns)
+    placeholders = ", ".join(["?"] * len(cols))
+    column_list = ", ".join(cols)
+    prepared = session.prepare(f"INSERT INTO {table} ({column_list}) VALUES ({placeholders})")
 
     def flush(batch):
         if not batch:
@@ -506,40 +662,127 @@ def write_cassandra(
             session,
             prepared,
             batch,
-            concurrency=8,
+            concurrency=concurrency,
             raise_on_first_error=False,
         )
         failures = [result for success, result in results if not success]
         if failures:
             sample = failures[0]
-            raise RuntimeError(f"Cassandra load failed for {len(failures)} rows. First error: {sample}")
+            raise RuntimeError(f"Cassandra load failed for {len(failures)} rows in {table}. First error: {sample}")
         return len(batch)
 
     written = 0
     batch = []
-    try:
-        for row in mart.select(*columns).toLocalIterator():
-            batch.append(row_args(row))
-            if len(batch) >= 500:
-                written += flush(batch)
-                batch = []
-        written += flush(batch)
-    finally:
-        session.shutdown()
-        cluster.shutdown()
-    print(f"serving.cassandra: wrote {written} rows to {keyspace}.{table}")
+    for row in df.select(*cols).toLocalIterator():
+        batch.append(tuple(getattr(row, col) for col in cols))
+        if on_progress:
+            on_progress(1)
+        if len(batch) >= batch_size:
+            written += flush(batch)
+            batch = []
+    written += flush(batch)
+    return written
 
 
-def print_idempotence_evidence(spark: SparkSession, paths: Paths) -> None:
-    targets = {
-        "bronze_usage_events_stream": paths.bronze / "usage_events_stream",
-        "silver_usage_events": paths.silver / "usage_events",
-        "gold_org_daily_usage_by_service": paths.gold / "org_daily_usage_by_service",
-    }
-    for name, path in targets.items():
-        if path.exists():
-            count = spark.read.parquet(str(path)).count()
-            print(f"idempotence_count.{name}: {count}")
+def load_to_cassandra_foreachbatch(
+    spark: SparkSession,
+    parquet_path: Path,
+    session,
+    table: str,
+    columns: Iterable[str],
+    checkpoint_path: Path,
+    batch_size: int = 500,
+    concurrency: int = 8,
+    on_progress: Optional[Callable[[int], None]] = None,
+) -> int:
+    cols = list(columns)
+    total: list[int] = [0]
+
+    def write_batch(batch_df: DataFrame, batch_id: int) -> None:
+        written = write_cassandra_table(batch_df, session, table, cols, batch_size, concurrency, on_progress)
+        total[0] += written
+
+    schema = spark.read.parquet(str(parquet_path)).schema
+    query = (
+        spark.readStream.schema(schema)
+        .parquet(str(parquet_path))
+        .writeStream.foreachBatch(write_batch)
+        .trigger(availableNow=True)
+        .option("checkpointLocation", str(checkpoint_path))
+        .start()
+    )
+    query.awaitTermination()
+    return total[0]
+
+
+
+
+_IDEMPOTENCE_TARGETS = [
+    "bronze / usage_events_stream",
+    "silver / usage_events",
+    "gold  / org_daily_usage_by_service",
+    "gold  / revenue_by_org_month",
+    "gold  / cost_anomaly_mart",
+    "gold  / tickets_by_org_date",
+    "gold  / genai_tokens_by_org_date",
+]
+
+
+def _target_path(name: str, paths: Paths) -> Path:
+    segment = name.split("/", 1)[1].strip()
+    layer = name.split("/")[0].strip()
+    return getattr(paths, layer.split()[0]) / segment
+
+
+def _count_target(spark: SparkSession, name: str, path: Path) -> int:
+    if name == "bronze / usage_events_stream":
+        return read_parquet_dir(spark, path).count()
+    return spark.read.parquet(str(path)).count()
+
+
+def snapshot_counts(spark: SparkSession, paths: Paths) -> Dict[str, int]:
+    """Lee conteos actuales de cada capa antes de correr el pipeline."""
+    counts: Dict[str, int] = {}
+    for name in _IDEMPOTENCE_TARGETS:
+        path = _target_path(name, paths)
+        if path.exists() and any(path.rglob("*.parquet")):
+            try:
+                counts[name] = _count_target(spark, name, path)
+            except Exception:
+                pass
+    return counts
+
+
+def print_idempotence_evidence(spark: SparkSession, paths: Paths, before: Dict[str, int]) -> None:
+    first_run = not before
+    if first_run:
+        _info("Primera ejecución — sin snapshot previo, mostrando conteos finales")
+
+    all_ok = True
+    for name in _IDEMPOTENCE_TARGETS:
+        path = _target_path(name, paths)
+        if not path.exists():
+            continue
+        after = _count_target(spark, name, path)
+
+        if first_run or name not in before:
+            _ok(name, after, 0)
+        else:
+            prev = before[name]
+            if prev == after:
+                rows_str = _c("32", f"{prev:>8,} → {after:,}")
+                print(f"  {_c('32', '✓')}  {name:<38} {rows_str}  {_c('32', 'idempotente')}")
+            else:
+                rows_str = _c("31", f"{prev:>8,} → {after:,}")
+                print(f"  {_c('31', '✗')}  {name:<38} {rows_str}  {_c('31', 'DIVERGENCIA')}")
+                all_ok = False
+
+    if not first_run:
+        print()
+        if all_ok:
+            print(_c("1;32", "  Idempotencia OK — todos los conteos son estables entre ejecuciones"))
+        else:
+            print(_c("1;31", "  Idempotencia FALLIDA — hay capas con conteos distintos"))
 
 
 def parse_args() -> argparse.Namespace:
@@ -547,39 +790,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--landing", default="cloud_provider_challenge_dataset_v1/datalake/landing")
     parser.add_argument("--datalake-out", default="cloud_provider_challenge_dataset_v1/datalake")
     parser.add_argument("--checkpoint-out", default="cloud_provider_challenge_dataset_v1/checkpoints")
-    parser.add_argument("--write-cassandra", action="store_true")
-    parser.add_argument("--cassandra-hosts", default="")
-    parser.add_argument("--cassandra-username", default=None)
-    parser.add_argument("--cassandra-password", default=None)
-    parser.add_argument("--cassandra-keyspace", default="cloud_analytics")
-    parser.add_argument("--cassandra-table", default="org_daily_usage_by_service")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     paths = Paths(Path(args.landing), Path(args.datalake_out), Path(args.checkpoint_out))
-    spark = build_spark("big-data-tp2-cloud-provider")
 
-    ingest_batch_to_bronze(spark, paths)
-    ingest_usage_stream_to_bronze(spark, paths)
-    build_silver_events(spark, paths)
-    mart = build_gold_finops(spark, paths)
-    print_idempotence_evidence(spark, paths)
+    _banner()
+    pipeline_start = time.perf_counter()
 
-    if args.write_cassandra:
-        if not args.cassandra_hosts:
-            raise ValueError("--cassandra-hosts is required when --write-cassandra is enabled")
-        write_cassandra(
-            mart,
-            args.cassandra_hosts,
-            args.cassandra_username,
-            args.cassandra_password,
-            args.cassandra_keyspace,
-            args.cassandra_table,
-        )
+    with _step(1, _TOTAL_STEPS, "Spark"):
+        spark = build_spark("big-data-tp2-cloud-provider")
+
+    before_counts = snapshot_counts(spark, paths)
+
+    with _step(2, _TOTAL_STEPS, "Bronze · Batch CSV"):
+        ingest_batch_to_bronze(spark, paths)
+
+    with _step(3, _TOTAL_STEPS, "Bronze · Streaming (usage_events)"):
+        ingest_usage_stream_to_bronze(spark, paths)
+
+    with _step(4, _TOTAL_STEPS, "Silver · Validación y quarantine"):
+        build_silver_events(spark, paths)
+
+    with _step(5, _TOTAL_STEPS, "Gold · Marts"):
+        build_gold_finops(spark, paths)
+        build_gold_revenue_by_org_month(spark, paths)
+        build_gold_cost_anomaly_mart(spark, paths)
+        build_gold_tickets_by_org_date(spark, paths)
+        build_gold_genai_tokens_by_org_date(spark, paths)
+
+    with _step(6, _TOTAL_STEPS, "Evidencia de idempotencia"):
+        print_idempotence_evidence(spark, paths, before_counts)
 
     spark.stop()
+    total = time.perf_counter() - pipeline_start
+    print()
+    print(_c("1;32", "=" * _W))
+    print(_c("1;32", f"  Pipeline completado en {total:.1f}s"))
+    print(_c("1;32", "=" * _W))
 
 
 if __name__ == "__main__":
