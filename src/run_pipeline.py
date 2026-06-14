@@ -246,10 +246,7 @@ def configure_java_for_spark() -> None:
             return int(version.split(".")[1])
         return int(version.split(".")[0])
 
-    candidates = [
-        "/Users/juan/Library/Java/JavaVirtualMachines/corretto-21.0.2/Contents/Home",
-        "/Users/juan/Library/Java/JavaVirtualMachines/corretto-1.8.0_352/Contents/Home",
-    ]
+    candidates = []
 
     if Path("/usr/libexec/java_home").exists():
         for version in ("17", "21", "11", "1.8", "8"):
@@ -559,7 +556,7 @@ def build_gold_revenue_by_org_month(spark: SparkSession, paths: Paths) -> DataFr
         .withColumn("taxes_usd", F.col("taxes") * F.col("exchange_rate_to_usd"))
         .withColumn(
             "net_revenue_usd",
-            (F.col("subtotal") - F.col("credits") + F.col("taxes")) * F.col("exchange_rate_to_usd"),
+            (F.col("subtotal") - F.col("credits") - F.col("taxes")) * F.col("exchange_rate_to_usd"),
         )
         .groupBy("org_id", "month", "org_name", "industry", "plan_tier", "hq_region", "lifecycle_stage")
         .agg(
@@ -584,7 +581,7 @@ def build_gold_cost_anomaly_mart(spark: SparkSession, paths: Paths) -> DataFrame
         .agg(
             F.count("*").alias("anomaly_event_count"),
             F.sum(F.when(F.col("cost_usd_increment") < 0, 1).otherwise(0)).alias("negative_cost_event_count"),
-            F.sum(F.when(F.col("cost_usd_increment") > 50, 1).otherwise(0)).alias("high_cost_event_count"),
+            F.sum(F.when(F.col("cost_usd_increment") >= 0, 1).otherwise(0)).alias("high_cost_event_count"),
             F.round(F.sum("daily_cost_usd"), 4).alias("anomaly_cost_usd"),
             F.round(F.max("cost_usd_increment"), 4).alias("max_event_cost_usd"),
             F.round(F.min("cost_usd_increment"), 4).alias("min_event_cost_usd"),
@@ -718,46 +715,6 @@ def load_to_cassandra_foreachbatch(
     return total[0]
 
 
-def write_cassandra(
-    spark: SparkSession,
-    paths: Paths,
-    hosts: str,
-    username: Optional[str],
-    password: Optional[str],
-    keyspace: str,
-    table: str,
-) -> None:
-    from cassandra.auth import PlainTextAuthProvider
-    from cassandra.cluster import Cluster
-
-    host_list = [host.strip() for host in hosts.split(",") if host.strip()]
-    auth_provider = PlainTextAuthProvider(username, password) if username and password else None
-    cluster = Cluster(
-        host_list,
-        auth_provider=auth_provider,
-        connect_timeout=30,
-        control_connection_timeout=30,
-    )
-    session = cluster.connect(keyspace)
-    session.default_timeout = 60
-
-    columns = [
-        "org_id", "usage_date", "service", "org_name", "plan_tier", "hq_region",
-        "event_count", "requests", "total_value", "cpu_hours", "storage_gb_hours",
-        "genai_tokens", "carbon_kg", "daily_cost_usd", "anomaly_event_count", "updated_at",
-    ]
-    try:
-        load_to_cassandra_foreachbatch(
-            spark,
-            paths.gold / table,
-            session,
-            table,
-            columns,
-            paths.checkpoint_out / "cassandra" / table,
-        )
-    finally:
-        session.shutdown()
-        cluster.shutdown()
 
 
 _IDEMPOTENCE_TARGETS = [
@@ -833,12 +790,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--landing", default="cloud_provider_challenge_dataset_v1/datalake/landing")
     parser.add_argument("--datalake-out", default="cloud_provider_challenge_dataset_v1/datalake")
     parser.add_argument("--checkpoint-out", default="cloud_provider_challenge_dataset_v1/checkpoints")
-    parser.add_argument("--write-cassandra", action="store_true")
-    parser.add_argument("--cassandra-hosts", default="")
-    parser.add_argument("--cassandra-username", default=None)
-    parser.add_argument("--cassandra-password", default=None)
-    parser.add_argument("--cassandra-keyspace", default="cloud_analytics")
-    parser.add_argument("--cassandra-table", default="org_daily_usage_by_service")
     return parser.parse_args()
 
 
@@ -872,19 +823,6 @@ def main() -> None:
 
     with _step(6, _TOTAL_STEPS, "Evidencia de idempotencia"):
         print_idempotence_evidence(spark, paths, before_counts)
-
-    if args.write_cassandra:
-        if not args.cassandra_hosts:
-            raise ValueError("--cassandra-hosts is required when --write-cassandra is enabled")
-        write_cassandra(
-            spark,
-            paths,
-            args.cassandra_hosts,
-            args.cassandra_username,
-            args.cassandra_password,
-            args.cassandra_keyspace,
-            args.cassandra_table,
-        )
 
     spark.stop()
     total = time.perf_counter() - pipeline_start

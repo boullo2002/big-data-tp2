@@ -230,12 +230,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--org-id", default=None, help="org_id a consultar (default: primero del mart)")
     parser.add_argument("--min-date", default=None, help="Fecha mínima YYYY-MM-DD")
     parser.add_argument("--max-date", default=None, help="Fecha máxima YYYY-MM-DD")
-    parser.add_argument("--point-date", default=None, help="Fecha puntual para consulta 2 (default: max_date)")
+    parser.add_argument("--point-date", default=None, help="Fecha puntual para consulta 6 (default: max_date)")
     parser.add_argument("--top-n", type=int, default=5, metavar="N",
                         help="Servicios a mostrar en query Top-N (consulta 2, default: 5)")
     parser.add_argument(
         "--query", nargs="+", type=str, choices=list(QUERY_DEFS), default=None,
-        metavar="ID", help="Consultas a ejecutar: 1a 1b 2 3 4 5 6 (default: todas)",
+        metavar="ID", help="Consultas a ejecutar: 1 2 3 4 5 6 7 (default: todas)",
     )
     return parser.parse_args()
 

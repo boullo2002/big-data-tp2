@@ -227,6 +227,15 @@ Se mantiene Lambda porque el caso combina dos necesidades distintas: procesamien
 | Gold | Marts agregados listos para serving. Sin joins en tiempo de consulta. |
 | Serving | Cassandra/AstraDB query-first, baja latencia. |
 
+### Enriquecimiento en Silver
+
+Los eventos se enriquecen con dos tablas maestras:
+
+- **`customers_orgs`** via `org_id`: agrega `org_name`, `plan_tier`, `hq_region`, `industry`, `lifecycle_stage`.
+- **`resources`** via `resource_id`: resuelve `service` y `region` cuando no vienen explícitos en el evento.
+
+La tabla `users` no se incorpora al enriquecimiento porque los eventos de uso no contienen `user_id` — la clave de join no existe a nivel de evento. Un join por `org_id` traería múltiples filas de usuarios por evento (una por cada usuario de la org), rompiendo el grano del evento. No hay forma correcta de enriquecer a nivel de usuario sin esa clave.
+
 ### Particionado y small files
 
 Todas las escrituras batch usan `repartition(col_partición).coalesce(1)` para consolidar 1 archivo por partición de fecha, evitando el problema de small files. El streaming Bronze genera múltiples archivos chicos (1 por micro-batch por fecha); se aplica un paso de **reparquet** inmediatamente después de que el stream termina, consolidando también a 1 archivo por partición. Para datasets más grandes el target sería `ceil(size_partición / 128 MB)` archivos.
@@ -314,7 +323,7 @@ Campos clave de cada tabla Cassandra. Las tablas marcadas con _(derivada)_ no ti
 | `genai_tokens` | double | Tokens de modelos GenAI consumidos (presente desde schema_version=2) |
 | `carbon_kg` | double | Emisiones de CO₂ estimadas en kg (presente desde schema_version=2) |
 | `daily_cost_usd` | double | Costo diario acumulado en USD |
-| `anomaly_event_count` | bigint | Eventos marcados como anómalos (costo fuera de rango por z-score/MAD/percentil) |
+| `anomaly_event_count` | bigint | Eventos marcados como anómalos (costo negativo o por encima del p90 del servicio) |
 
 ### `org_service_cost_14d` _(derivada)_
 
@@ -361,6 +370,7 @@ Calculada a partir de `tickets_by_org_date`, filtrando `severity = 'critical'` y
 |---|---|---|
 | `org_id` | text | Identificador de la organización (partition key) |
 | `usage_date` | date | Fecha del consumo (clustering key DESC) |
+| `event_count` | bigint | Cantidad de eventos GenAI registrados en esa fecha |
 | `genai_tokens` | double | Total de tokens consumidos en modelos GenAI |
 | `estimated_token_cost_usd` | double | Costo estimado en USD basado en consumo de tokens |
 | `requests` | double | Cantidad de requests a servicios GenAI |
@@ -373,9 +383,9 @@ Calculada a partir de `tickets_by_org_date`, filtrando `severity = 'critical'` y
 | `org_id` | text | Identificador de la organización (partition key) |
 | `usage_date` | date | Fecha del evento (clustering key DESC) |
 | `service` | text | Servicio donde se detectó la anomalía |
-| `anomaly_event_count` | bigint | Eventos con costo anómalo detectado (z-score, MAD o p99) |
-| `negative_cost_event_count` | bigint | Eventos con `cost_usd_increment < -0.01` |
-| `high_cost_event_count` | bigint | Eventos con costo por encima del umbral del percentil 99 |
+| `anomaly_event_count` | bigint | Eventos con costo anómalo detectado (negativo o > p90 del servicio) |
+| `negative_cost_event_count` | bigint | Eventos con `cost_usd_increment < 0` |
+| `high_cost_event_count` | bigint | Eventos con costo por encima del p90 del servicio |
 | `anomaly_cost_usd` | double | Costo total acumulado de los eventos anómalos |
 | `max_event_cost_usd` | double | Costo máximo registrado en un evento individual |
 | `min_event_cost_usd` | double | Costo mínimo registrado en un evento individual |
