@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import time
 from pathlib import Path
+
+logging.getLogger("cassandra").setLevel(logging.ERROR)
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -22,18 +25,27 @@ def _c(code: str, text: str) -> str:
 
 def _banner() -> None:
     print(_c("1;36", "=" * _W))
-    print(_c("1;36", "  TP2  ·  Consultas AstraDB  ·  Big Data ITBA"))
+    print(_c("1;36", "  Consultas AstraDB"))
     print(_c("1;36", "=" * _W))
     print()
+
+
+_CONSIGNA_QUERIES = {"1", "2", "3", "4", "5"}
+
+
+def _section_header(label: str) -> None:
+    print(f"\n{_c('1;35', f'▸ {label}')}")
+    print(_c("35", "─" * _W))
 
 
 def _query_header(num: int, total: int, title: str, org_id: str, min_date: str, max_date: str) -> None:
     tag = _c("1;33", f"[{num}/{total}]")
     print(f"\n{tag} {_c('1', title)}")
     print(_c("90", "─" * _W))
+    date_str = f"{min_date} → {max_date}" if min_date else "últimos 14 días"
     print(
         f"  {_c('90', 'org:')} {_c('36', org_id)}"
-        f"  {_c('90', 'rango:')} {_c('36', f'{min_date} → {max_date}')}"
+        f"  {_c('90', 'rango:')} {_c('36', date_str)}"
     )
 
 
@@ -45,7 +57,7 @@ def _info(msg: str) -> None:
 # Defaults dinámicos desde Gold Parquet (sin Spark)
 # ---------------------------------------------------------------------------
 
-def _read_gold_defaults(datalake: str, table: str, date_col: str) -> tuple[str, str, str]:
+def _read_gold_defaults(datalake: str, table: str, date_col: str | None) -> tuple[str, str, str]:
     """Devuelve (org_id, min_date, max_date) leyendo el parquet de la tabla Gold."""
     import pandas as pd
     parquet_path = Path(datalake) / "gold" / table
@@ -54,16 +66,23 @@ def _read_gold_defaults(datalake: str, table: str, date_col: str) -> tuple[str, 
             f"No se encontró el parquet Gold en '{parquet_path}'.\n"
             f"Ejecutá desde la raíz del repo o pasá --datalake con la ruta correcta."
         )
-    df = pd.read_parquet(parquet_path, columns=["org_id", date_col])
+    cols = ["org_id"] + ([date_col] if date_col else [])
+    df = pd.read_parquet(parquet_path, columns=cols)
     org_id = str(df["org_id"].iloc[0])
+    if not date_col:
+        return (org_id, "", "")
     dates = df[date_col].astype(str)
-    min_date = dates.min()[:10]
-    max_date = dates.max()[:10]
-    return (org_id, min_date, max_date)
+    return (org_id, dates.min()[:10], dates.max()[:10])
 
 
 def _point_date(max_date: str) -> str:
     return max_date
+
+
+def _subtract_days(date_str: str, days: int) -> str:
+    from datetime import date, timedelta
+    d = date.fromisoformat(date_str)
+    return (d - timedelta(days=days)).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -93,12 +112,12 @@ def _rows_to_str(rows) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Definición de las 6 consultas
+# Definición de las 7 consultas
 # ---------------------------------------------------------------------------
 
 QUERY_DEFS = {
-    1: {
-        "title": "Costos y requests diarios por org y servicio",
+    "1": {
+        "title": "Costos y requests diarios por org y servicio (rango de fechas)",
         "table": "org_daily_usage_by_service",
         "date_col": "usage_date",
         "cql": (
@@ -109,19 +128,33 @@ QUERY_DEFS = {
         ),
         "params": lambda p: (p["org_id"], p["min_date"], p["max_date"]),
     },
-    2: {
-        "title": "Detalle de servicios y anomalías en una fecha puntual",
-        "table": "org_daily_usage_by_service",
-        "date_col": "usage_date",
+    "2": {
+        "title": "Top-N servicios por costo acumulado (últimos 14 días)",
+        "table": "org_service_cost_14d",
+        "defaults_table": "org_daily_usage_by_service",
+        "date_col": None,
         "cql": (
-            "SELECT org_id, usage_date, service, requests, cpu_hours, storage_gb_hours, "
-            "genai_tokens, carbon_kg, daily_cost_usd, anomaly_event_count, event_count "
-            "FROM org_daily_usage_by_service "
-            "WHERE org_id = %s AND usage_date = %s"
+            "SELECT org_id, service, total_cost_usd, event_count, requests "
+            "FROM org_service_cost_14d "
+            "WHERE org_id = %s LIMIT %s"
         ),
-        "params": lambda p: (p["org_id"], p["point_date"]),
+        "params": lambda p: (p["org_id"], p["top_n"]),
     },
-    3: {
+    "3": {
+        "title": "Evolución de tickets críticos y SLA breach por día (últimos 30 días)",
+        "table": "tickets_critical_by_org_date",
+        "defaults_table": "tickets_by_org_date",
+        "date_col": "ticket_date",
+        "window_days": 30,
+        "cql": (
+            "SELECT org_id, ticket_date, ticket_count, resolved_ticket_count, "
+            "open_ticket_count, sla_breach_count, sla_breach_rate, avg_csat "
+            "FROM tickets_critical_by_org_date "
+            "WHERE org_id = %s AND ticket_date >= %s AND ticket_date <= %s"
+        ),
+        "params": lambda p: (p["org_id"], p["min_date"], p["max_date"]),
+    },
+    "4": {
         "title": "Revenue mensual por organización",
         "table": "revenue_by_org_month",
         "date_col": "month",
@@ -133,7 +166,31 @@ QUERY_DEFS = {
         ),
         "params": lambda p: (p["org_id"], p["min_date"], p["max_date"]),
     },
-    4: {
+    "5": {
+        "title": "Tokens GenAI y costo estimado por día",
+        "table": "genai_tokens_by_org_date",
+        "date_col": "usage_date",
+        "cql": (
+            "SELECT org_id, usage_date, genai_tokens, estimated_token_cost_usd, "
+            "requests, carbon_kg "
+            "FROM genai_tokens_by_org_date "
+            "WHERE org_id = %s AND usage_date >= %s AND usage_date <= %s"
+        ),
+        "params": lambda p: (p["org_id"], p["min_date"], p["max_date"]),
+    },
+    "6": {
+        "title": "Detalle de servicios y anomalías en una fecha puntual",
+        "table": "org_daily_usage_by_service",
+        "date_col": "usage_date",
+        "cql": (
+            "SELECT org_id, usage_date, service, requests, cpu_hours, storage_gb_hours, "
+            "genai_tokens, carbon_kg, daily_cost_usd, anomaly_event_count, event_count "
+            "FROM org_daily_usage_by_service "
+            "WHERE org_id = %s AND usage_date = %s"
+        ),
+        "params": lambda p: (p["org_id"], p["point_date"]),
+    },
+    "7": {
         "title": "Eventos anómalos de costo",
         "table": "cost_anomaly_mart",
         "date_col": "usage_date",
@@ -142,30 +199,6 @@ QUERY_DEFS = {
             "negative_cost_event_count, high_cost_event_count, "
             "anomaly_cost_usd, max_event_cost_usd, min_event_cost_usd "
             "FROM cost_anomaly_mart "
-            "WHERE org_id = %s AND usage_date >= %s AND usage_date <= %s"
-        ),
-        "params": lambda p: (p["org_id"], p["min_date"], p["max_date"]),
-    },
-    5: {
-        "title": "Tickets, SLA breach rate y CSAT promedio",
-        "table": "tickets_by_org_date",
-        "date_col": "ticket_date",
-        "cql": (
-            "SELECT org_id, ticket_date, category, severity, ticket_count, "
-            "sla_breach_count, sla_breach_rate, avg_csat "
-            "FROM tickets_by_org_date "
-            "WHERE org_id = %s AND ticket_date >= %s AND ticket_date <= %s"
-        ),
-        "params": lambda p: (p["org_id"], p["min_date"], p["max_date"]),
-    },
-    6: {
-        "title": "Consumo GenAI por org y fecha",
-        "table": "genai_tokens_by_org_date",
-        "date_col": "usage_date",
-        "cql": (
-            "SELECT org_id, usage_date, genai_tokens, estimated_token_cost_usd, "
-            "requests, carbon_kg "
-            "FROM genai_tokens_by_org_date "
             "WHERE org_id = %s AND usage_date >= %s AND usage_date <= %s"
         ),
         "params": lambda p: (p["org_id"], p["min_date"], p["max_date"]),
@@ -198,9 +231,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-date", default=None, help="Fecha mínima YYYY-MM-DD")
     parser.add_argument("--max-date", default=None, help="Fecha máxima YYYY-MM-DD")
     parser.add_argument("--point-date", default=None, help="Fecha puntual para consulta 2 (default: max_date)")
+    parser.add_argument("--top-n", type=int, default=5, metavar="N",
+                        help="Servicios a mostrar en query Top-N (consulta 2, default: 5)")
     parser.add_argument(
-        "--query", nargs="+", type=int, choices=list(QUERY_DEFS), default=None,
-        metavar="N", help="Consultas a ejecutar 1-6 (default: todas)",
+        "--query", nargs="+", type=str, choices=list(QUERY_DEFS), default=None,
+        metavar="ID", help="Consultas a ejecutar: 1a 1b 2 3 4 5 6 (default: todas)",
     )
     return parser.parse_args()
 
@@ -245,17 +280,31 @@ def main() -> None:
 
     queries_to_run = args.query or list(QUERY_DEFS)
     total_rows = 0
+    _printed_consigna_header = False
+    _printed_extra_header = False
 
     try:
         for q_num in queries_to_run:
             q = QUERY_DEFS[q_num]
+            if q_num in _CONSIGNA_QUERIES and not _printed_consigna_header:
+                _section_header("Consultas de la consigna")
+                _printed_consigna_header = True
+            elif q_num not in _CONSIGNA_QUERIES and not _printed_extra_header:
+                _section_header("Consultas extra")
+                _printed_extra_header = True
 
-            org_id, dyn_min, dyn_max = _read_gold_defaults(args.datalake, q["table"], q["date_col"])
+            org_id, dyn_min, dyn_max = _read_gold_defaults(args.datalake, q.get("defaults_table", q["table"]), q["date_col"])
+            effective_max = args.max_date or dyn_max
+            if not args.min_date and q.get("window_days") and effective_max:
+                effective_min = _subtract_days(effective_max, q["window_days"] - 1)
+            else:
+                effective_min = args.min_date or dyn_min
             resolved = {
                 "org_id":     args.org_id or org_id,
-                "min_date":   args.min_date or dyn_min,
-                "max_date":   args.max_date or dyn_max,
-                "point_date": args.point_date or _point_date(args.max_date or dyn_max),
+                "min_date":   effective_min,
+                "max_date":   effective_max,
+                "point_date": args.point_date or _point_date(effective_max),
+                "top_n":      args.top_n,
             }
 
             _query_header(q_num, len(queries_to_run), q["title"],

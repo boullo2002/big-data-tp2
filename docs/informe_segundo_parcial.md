@@ -141,7 +141,7 @@ Bronze batch, Silver y Gold escriben en modo `overwrite`. Streaming usa checkpoi
 ## 5. Artefactos de entrega
 
 - `notebooks/segundo_parcial_big_data.ipynb`: notebook reproducible para Colab.
-- `src/tp2_pipeline.py`: modulo PySpark reutilizable.
+- `src/run_pipeline.py`: modulo PySpark reutilizable.
 - `cql/01_create_keyspace.cql`: creacion de keyspace.
 - `cql/02_create_tables.cql`: tablas query-first de los marts Gold.
 - `cql/03_queries_demo.cql`: consultas de aceptacion.

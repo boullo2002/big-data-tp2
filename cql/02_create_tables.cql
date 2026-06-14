@@ -73,6 +73,36 @@ CREATE TABLE IF NOT EXISTS tickets_by_org_date (
     PRIMARY KEY ((org_id), ticket_date, category, severity)
 ) WITH CLUSTERING ORDER BY (ticket_date DESC, category ASC, severity ASC);
 
+CREATE TABLE IF NOT EXISTS org_service_cost_14d (
+    org_id text,
+    total_cost_usd double,
+    service text,
+    org_name text,
+    plan_tier text,
+    hq_region text,
+    event_count bigint,
+    requests double,
+    updated_at timestamp,
+    PRIMARY KEY ((org_id), total_cost_usd, service)
+) WITH CLUSTERING ORDER BY (total_cost_usd DESC, service ASC);
+
+CREATE TABLE IF NOT EXISTS tickets_critical_by_org_date (
+    org_id text,
+    ticket_date date,
+    org_name text,
+    industry text,
+    plan_tier text,
+    hq_region text,
+    ticket_count bigint,
+    resolved_ticket_count bigint,
+    open_ticket_count bigint,
+    sla_breach_count bigint,
+    sla_breach_rate double,
+    avg_csat double,
+    updated_at timestamp,
+    PRIMARY KEY ((org_id), ticket_date)
+) WITH CLUSTERING ORDER BY (ticket_date DESC);
+
 CREATE TABLE IF NOT EXISTS genai_tokens_by_org_date (
     org_id text,
     usage_date date,
