@@ -42,8 +42,6 @@ cql/
   01_create_keyspace.cql   # Keyspace cloud_analytics
   02_create_tables.cql     # 7 tablas query-first
   03_queries_demo.cql      # 7 consultas de demo
-docs/
-  decision_log.md          # Decisiones de arquitectura
 cloud_provider_challenge_dataset_v1/
   datalake/
     landing/               # Datos crudos (CSV + JSONL) — inmutable
