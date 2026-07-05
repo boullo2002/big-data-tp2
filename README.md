@@ -220,8 +220,8 @@ Se mantiene Lambda porque el caso combina dos necesidades distintas: procesamien
 | Capa | Responsabilidad |
 |---|---|
 | Landing | Fuente cruda inmutable. Base para reprocesamiento. |
-| Bronze | Tipificación explícita, columnas técnicas (`ingest_ts`, `source_file`), dedupe por clave natural. Sin lógica de negocio. |
-| Silver | Conformado, joins de enriquecimiento, features analíticas, reglas de calidad, quarantine. |
+| Bronze | Tipificación explícita, columnas técnicas (`ingest_ts`, `source_file`). Las fuentes batch deduplican por clave natural; el stream de eventos se escribe como copia fiel *append-only* (la dedupe se difiere a Silver). Sin lógica de negocio. |
+| Silver | Conformado, dedupe de eventos por `event_id`, joins de enriquecimiento, features analíticas, reglas de calidad, quarantine. |
 | Gold | Marts agregados listos para serving. Sin joins en tiempo de consulta. |
 | Serving | Cassandra/AstraDB query-first, baja latencia. |
 
@@ -267,6 +267,17 @@ La detección opera en dos niveles:
 
 El flag `is_cost_anomaly` se agrega en Silver y se agrega en Gold como `anomaly_event_count` en `org_daily_usage_by_service` y como mart dedicado en `cost_anomaly_mart`.
 
+### Ingesta streaming: por qué Bronze es *stateless* (sin watermark)
+
+El stream Bronze se procesa con `readStream` + `trigger(availableNow=True)` y **no** aplica watermark ni deduplicación en esta capa. La razón es la naturaleza del dato:
+
+- Los archivos `.jsonl` simulan micro-lotes pero constituyen un **backfill histórico acotado**: 43.200 eventos que abarcan **60 días (2025-07-03 → 2025-08-31)**, repartidos en 120 archivos que **no están ordenados temporalmente**.
+- Un watermark (p. ej. `withWatermark("event_ts", "2 days")`) está pensado para streams **no-acotados y aproximadamente ordenados en el tiempo**, donde se aceptan descartar rezagados para acotar el estado. Aplicado a este backfill desordenado, en cuanto un micro-batch temprano trae un evento cercano al máximo (31-ago), el watermark avanza y **descarta como *late data* todo evento anterior a `max(event_ts) − ventana`** — es decir, la gran mayoría del histórico.
+
+Por eso Bronze se mantiene como **copia fiel *append-only*** del origen (principio de la medallion architecture) y la **deduplicación por `event_id` se difiere a Silver**, donde el input es finito, el estado determinístico y la dedupe es una regla de conformación legítima. Como los `event_id` del origen ya son únicos, se preservan los **43.200 eventos completos**.
+
+> **Nota de corrección:** una versión previa aplicaba `withWatermark("event_ts", "2 days") + dropDuplicates` en el stream Bronze, lo que reducía el histórico a ~8.395 eventos y arrastraba la pérdida a Silver y Gold. El diseño actual procesa el total esperado.
+
 ### Evolución de esquema (schema_version)
 
 El stream de eventos tiene dos versiones de esquema conviviendo en el mismo directorio:
@@ -298,7 +309,7 @@ Cada tabla modela exactamente la consulta que responde. `org_id` es siempre part
 ### Idempotencia
 
 - **Parquet**: `mode("overwrite")` en todas las capas batch. Re-ejecutar reemplaza la salida previa.
-- **Streaming**: checkpointing garantiza que cada archivo JSONL se procesa exactamente una vez. `dropDuplicates(["event_id"])` maneja late data.
+- **Streaming**: checkpointing garantiza que cada archivo JSONL se procesa exactamente una vez. El stream Bronze es *stateless* (sin watermark): al ser un backfill histórico **acotado** de archivos provistos —y no un stream no-acotado ni ordenado en el tiempo— un watermark descartaría como *late data* la mayor parte del histórico. La deduplicación por `event_id` se realiza en Silver, donde el estado es finito y determinístico.
 - **Cassandra**: upsert natural por primary key determinística. Re-cargar no duplica registros.
 
 ---
@@ -414,14 +425,14 @@ Calculada a partir de `tickets_by_org_date`, filtrando `severity = 'critical'` y
 | bronze / customers_orgs | 80 | 1 |
 | bronze / users | 800 | 1 |
 | bronze / billing_monthly | 240 | 1 |
-| bronze / usage_events_stream | 8,395 | 60 (1 por fecha) |
-| silver / usage_events | 7,946 | 60 (1 por fecha) |
-| quarantine / usage_events | 449 | 60 (1 por fecha) |
-| gold / org_daily_usage_by_service | 5,406 | 60 (1 por fecha) |
+| bronze / usage_events_stream | 43,200 | 60 (1 por fecha) |
+| silver / usage_events | 40,956 | 60 (1 por fecha) |
+| quarantine / usage_events | 2,244 | 60 (1 por fecha) |
+| gold / org_daily_usage_by_service | 11,050 | 60 (1 por fecha) |
 | gold / revenue_by_org_month | 240 | 3 (1 por mes) |
-| gold / cost_anomaly_mart | 12 | 11 (1 por fecha) |
+| gold / cost_anomaly_mart | 3,497 | 60 (1 por fecha) |
 | gold / tickets_by_org_date | 995 | 115 (1 por fecha) |
-| gold / genai_tokens_by_org_date | 517 | 60 (1 por fecha) |
+| gold / genai_tokens_by_org_date | 1,131 | 60 (1 por fecha) |
 
 ### Tamaños de tablas Parquet
 

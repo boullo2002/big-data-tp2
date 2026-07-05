@@ -394,6 +394,13 @@ def ingest_usage_stream_to_bronze(spark: SparkSession, paths: Paths) -> None:
     output_path = paths.bronze / "usage_events_stream"
     checkpoint_path = paths.checkpoint_out / "usage_events_bronze"
 
+    # Bronze = copia fiel y append-only del origen (medallion). No aplicamos watermark
+    # ni dedup acá: esto es un backfill histórico ACOTADO de archivos provistos, no un
+    # stream no-acotado y ordenado en el tiempo. Un watermark descartaría como "late data"
+    # todo evento anterior a max(event_ts) - ventana, y como los .jsonl NO vienen ordenados
+    # temporalmente (abarcan 60 días desordenados) eso perdería la mayoría del histórico.
+    # El stream queda stateless (sin state store). La deduplicación por event_id se hace
+    # en Silver, que es la capa responsable de limpieza y conformación.
     stream_df = (
         spark.readStream.schema(USAGE_SCHEMA)
         .option("maxFilesPerTrigger", 10)
@@ -402,8 +409,6 @@ def ingest_usage_stream_to_bronze(spark: SparkSession, paths: Paths) -> None:
         .withColumn("usage_date", F.to_date("event_ts"))
         .withColumn("ingest_ts", F.current_timestamp())
         .withColumn("source_file", F.input_file_name())
-        .withWatermark("event_ts", "2 days")
-        .dropDuplicates(["event_id"])
     )
 
     query = (
@@ -444,7 +449,9 @@ def ingest_usage_stream_to_bronze(spark: SparkSession, paths: Paths) -> None:
 
 
 def build_silver_events(spark: SparkSession, paths: Paths) -> None:
-    events = read_parquet_dir(spark, paths.bronze / "usage_events_stream")
+    # Dedup por clave natural (event_id) en Silver: Bronze es raw append-only, la
+    # deduplicación es una regla de conformación que corresponde a esta capa.
+    events = read_parquet_dir(spark, paths.bronze / "usage_events_stream").dropDuplicates(["event_id"])
     orgs = spark.read.parquet(str(paths.bronze / "customers_orgs")).select(
         "org_id", "org_name", "industry", "hq_region", "plan_tier", "lifecycle_stage"
     )
